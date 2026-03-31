@@ -72,6 +72,8 @@ def __get_shared_library():
 
     if is_arm and is_mac:
         return ctypes.CDLL(os.path.join(path_to_signer_folders, "lighter-signer-darwin-arm64.dylib"))
+    elif is_x64 and is_mac:
+        return ctypes.CDLL(os.path.join(path_to_signer_folders, "lighter-signer-darwin-amd64.dylib"))
     elif is_linux and is_x64:
         return ctypes.CDLL(os.path.join(path_to_signer_folders, "lighter-signer-linux-amd64.so"))
     elif is_linux and is_arm:
