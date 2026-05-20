@@ -64,6 +64,23 @@ python examples/ws.py
 python examples/create_cancel_order.py
 ```
 
+## Paper Trading
+
+#### [Snapshot Mode](examples/paper_trading_snapshot.py)
+```sh
+python examples/paper_trading_snapshot.py
+```
+
+#### [Live Mode](examples/paper_trading_live.py)
+```sh
+python examples/paper_trading_live.py
+```
+
+#### [Health Inspection](examples/paper_trading_health.py)
+```sh
+python examples/paper_trading_health.py
+```
+
 ## Documentation for API Endpoints
 
 All URIs are relative to *https://mainnet.zklighter.elliot.ai*
