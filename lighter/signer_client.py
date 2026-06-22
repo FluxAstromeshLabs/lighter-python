@@ -1,3 +1,4 @@
+import atexit
 import ctypes
 from fractions import Fraction
 from functools import wraps
@@ -6,6 +7,8 @@ import json
 import platform
 import logging
 import os
+import shutil
+import tempfile
 import time
 from typing import Dict, List, Optional, Union, Tuple, Any
 
@@ -58,9 +61,18 @@ class SignedTxResponse(ctypes.Structure):
 
 
 __signer = None
+__isolated_signer_directories = []
 
 
-def __get_shared_library():
+def __cleanup_isolated_signer_directories():
+    for temp_dir in __isolated_signer_directories:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+atexit.register(__cleanup_isolated_signer_directories)
+
+
+def __get_shared_library_path():
     is_linux = platform.system() == "Linux"
     is_mac = platform.system() == "Darwin"
     is_windows = platform.system() == "Windows"
@@ -71,13 +83,15 @@ def __get_shared_library():
     path_to_signer_folders = os.path.join(current_file_directory, "signers")
 
     if is_arm and is_mac:
-        return ctypes.CDLL(os.path.join(path_to_signer_folders, "lighter-signer-darwin-arm64.dylib"))
+        return os.path.join(path_to_signer_folders, "lighter-signer-darwin-arm64.dylib")
+    elif is_x64 and is_mac:
+        return os.path.join(path_to_signer_folders, "lighter-signer-darwin-amd64.dylib")
     elif is_linux and is_x64:
-        return ctypes.CDLL(os.path.join(path_to_signer_folders, "lighter-signer-linux-amd64.so"))
+        return os.path.join(path_to_signer_folders, "lighter-signer-linux-amd64.so")
     elif is_linux and is_arm:
-        return ctypes.CDLL(os.path.join(path_to_signer_folders, "lighter-signer-linux-arm64.so"))
+        return os.path.join(path_to_signer_folders, "lighter-signer-linux-arm64.so")
     elif is_windows and is_x64:
-        return ctypes.CDLL(os.path.join(path_to_signer_folders, "lighter-signer-windows-amd64.dll"))
+        return os.path.join(path_to_signer_folders, "lighter-signer-windows-amd64.dll")
     else:
         raise Exception(
             f"Unsupported platform/architecture: {platform.system()}/{platform.machine()}. "
@@ -85,9 +99,29 @@ def __get_shared_library():
         )
 
 
-def decode_and_free(ptr: Any) -> Optional[str]:
+def __load_shared_library(library_path: str):
+    return ctypes.CDLL(library_path)
+
+
+def __get_shared_library():
+    return __load_shared_library(__get_shared_library_path())
+
+
+def __get_isolated_library():
+    shared_library_path = __get_shared_library_path()
+    isolated_directory = tempfile.mkdtemp(prefix="lighter-signer-")
+    __isolated_signer_directories.append(isolated_directory)
+
+    isolated_library_path = os.path.join(isolated_directory, os.path.basename(shared_library_path))
+    shutil.copy2(shared_library_path, isolated_library_path)
+    return __load_shared_library(isolated_library_path)
+
+
+def decode_and_free(ptr: Any, signer=None) -> Optional[str]:
     if not ptr:
         return None
+
+    signer = signer or get_signer()
     try:
         # Read the string from the pointer
         c_str = ctypes.cast(ptr, ctypes.c_char_p).value
@@ -98,7 +132,7 @@ def decode_and_free(ptr: Any) -> Optional[str]:
         # Free the memory using the signer's own Free function to ensure
         # the same C runtime that allocated the memory also frees it.
         # This is critical on Windows where different CRTs have separate heaps.
-        __signer.Free(ptr)
+        signer.Free(ptr)
 
 
 def __populate_shared_library_functions(signer):
@@ -194,11 +228,21 @@ def get_signer():
     return __signer
 
 
-def create_api_key():
-    result = lighter.signer_client.get_signer().GenerateAPIKey()
-    private_key_str = decode_and_free(result.privateKey)
-    public_key_str = decode_and_free(result.publicKey)
-    error = decode_and_free(result.err)
+def create_signer(isolated: bool = False):
+    if not isolated:
+        return get_signer()
+
+    signer = __get_isolated_library()
+    __populate_shared_library_functions(signer)
+    return signer
+
+
+def create_api_key(signer=None):
+    signer = signer or lighter.signer_client.get_signer()
+    result = signer.GenerateAPIKey()
+    private_key_str = decode_and_free(result.privateKey, signer)
+    public_key_str = decode_and_free(result.publicKey, signer)
+    error = decode_and_free(result.err, signer)
     return private_key_str, public_key_str, error
 
 
@@ -321,6 +365,7 @@ class SignerClient:
             account_index,
             api_private_keys: Dict[int, str],
             nonce_management_type=nonce_manager.NonceManagerType.OPTIMISTIC,
+            isolated_signer_instance: bool = True,
     ):
         self.url = url
         self.chain_id = 304 if ("mainnet" in url or "api" in url) else 300
@@ -328,7 +373,7 @@ class SignerClient:
         self.validate_api_private_keys(api_private_keys)
         self.api_key_dict = api_private_keys
         self.account_index = account_index
-        self.signer = get_signer()
+        self.signer = create_signer(isolated=isolated_signer_instance)
         self.api_client = lighter.ApiClient(configuration=Configuration(host=url))
         self.tx_api = lighter.TransactionApi(self.api_client)
         self.order_api = lighter.OrderApi(self.api_client)
@@ -343,25 +388,23 @@ class SignerClient:
             self.create_client(api_key_index)
 
     # === signer helpers ===
-    @staticmethod
-    def __decode_tx_info(result: SignedTxResponse) -> Union[Tuple[str, str, str, None], Tuple[None, None, None, str]]:
+    def __decode_tx_info(self, result: SignedTxResponse) -> Union[Tuple[str, str, str, None], Tuple[None, None, None, str]]:
 
-        err_str = decode_and_free(result.err)
-        tx_info_str = decode_and_free(result.txInfo)
-        tx_hash_str = decode_and_free(result.txHash)
-        decode_and_free(result.messageToSign)
+        err_str = decode_and_free(result.err, self.signer)
+        tx_info_str = decode_and_free(result.txInfo, self.signer)
+        tx_hash_str = decode_and_free(result.txHash, self.signer)
+        decode_and_free(result.messageToSign, self.signer)
 
         if err_str:
             return None, None, None, err_str
 
         return result.txType, tx_info_str, tx_hash_str, None
 
-    @staticmethod
-    def __decode_and_sign_tx_info(eth_private_key: str, result: SignedTxResponse) -> Union[Tuple[str, str, str, None], Tuple[None, None, None, str]]:
-        err_str = decode_and_free(result.err)
-        tx_info_str = decode_and_free(result.txInfo)
-        tx_hash_str = decode_and_free(result.txHash)
-        msg_to_sign_str = decode_and_free(result.messageToSign)
+    def __decode_and_sign_tx_info(self, eth_private_key: str, result: SignedTxResponse) -> Union[Tuple[str, str, str, None], Tuple[None, None, None, str]]:
+        err_str = decode_and_free(result.err, self.signer)
+        tx_info_str = decode_and_free(result.txInfo, self.signer)
+        tx_hash_str = decode_and_free(result.txHash, self.signer)
+        msg_to_sign_str = decode_and_free(result.messageToSign, self.signer)
 
         if err_str:
             return None, None, None, err_str
@@ -393,7 +436,7 @@ class SignerClient:
             api_key_index,
             self.account_index,
         )
-        err = decode_and_free(err_ptr)
+        err = decode_and_free(err_ptr, self.signer)
         if err is not None:
             raise Exception(err)
 
@@ -403,7 +446,7 @@ class SignerClient:
             account_index: int,
     ) -> Optional[str]:
         err_ptr = self.signer.CheckClient(api_key_index, account_index)
-        return decode_and_free(err_ptr)
+        return decode_and_free(err_ptr, self.signer)
 
     # check_client verifies that the given API key associated with (api_key_index, account_index) matches the one on Lighter
     def check_client(self):
@@ -436,8 +479,8 @@ class SignerClient:
 
         result = self.signer.CreateAuthToken(deadline + timestamp, api_key_index, self.account_index)
 
-        auth = decode_and_free(result.str)
-        error = decode_and_free(result.err)
+        auth = decode_and_free(result.str, self.signer)
+        error = decode_and_free(result.err, self.signer)
         return auth, error
 
     def sign_change_api_key(self, eth_private_key: str, new_pubkey: str, skip_nonce: int = SKIP_NONCE_OFF, nonce: int = DEFAULT_NONCE, api_key_index: int = DEFAULT_API_KEY_INDEX) -> Union[Tuple[str, str, str, None], Tuple[None, None, None, str]]:
